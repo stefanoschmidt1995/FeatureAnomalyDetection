@@ -1,0 +1,218 @@
+#! /usr/bin/env python
+"""
+Executable to gather a large number of features and assign them an anomaly probability
+
+To run
+	python bin/fad_rank --features-files bullshit/test_executable/features/var_features.csv bullshit/test_executable/features/var_features_bis.csv --verbose
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+import sys
+import warnings
+
+import argparse
+import os
+
+from gwpy.timeseries import TimeSeries
+import fad.utils
+from fad import feature_aggregator, feature_generator
+from fad.utils import plot_features, plot_scattered_features
+
+from sklearn.mixture import BayesianGaussianMixture
+import pickle
+
+parser = argparse.ArgumentParser(__doc__)
+
+parser.add_argument(
+	"--merged-features-files", type = str, required = False,
+	help="If given, features files in which all the features are saved")
+
+parser.add_argument(
+	"--n-components", type = int, required = False, default = 10,
+	help="Max number of components for DPGMM")
+parser.add_argument(
+	"--convergence-threshold", type = float, required = False, default = None,
+	help="Threshold for iterative estimation of likelihood function")
+parser.add_argument(
+	"--max-iter", type = int, required = False, default = 1000,
+	help="Maximum number of iterations")
+
+parser.add_argument(
+	"--likelihood-file", type = str, required = True,
+	help="The likelihood file (pkl format). If --train-likelihood, likelihood will be saved there, otherwise the likelihood model will be loaded from there")
+parser.add_argument(
+	"--rank-file", type = str, required = True,
+	help="The rank file (gwpy csv format). The likelihood of each GPS time will be stored there")
+
+parser.add_argument(
+	"--train-likelihood", action='store_true',
+	help="Whether to train the likelihood function with the given features")
+
+
+parser.add_argument(
+	"--plot", action='store_true',
+	help="Whether to plot the feature timeseries")
+
+parser.add_argument(
+	"--verbose", action='store_true',
+	help="Be verbose?")
+
+####################
+
+class dummy_feat_aggregator():
+	def __init__(self, matrix, gen):
+		self.features = {}
+		self.feature_matrix = matrix
+		self.feature_labels = list(gen.features.keys())
+		for c, k in zip(matrix.T, gen.features.keys()):
+			self.features[k] = c
+
+def plot_sample_sets(sample_set, labels, lm, id_ref = None):
+	if id_ref: N = len(sample_set[id_ref])
+	else: N = len(sample_set[0])
+
+		#Doing histogram
+	fig, ax = plt.subplots(1,1)
+	for i, (sset, l) in enumerate(zip(sample_set, labels)):
+		likelihoods = -lm.score_samples(sset)
+		
+		bins = 200
+		counts, bins = np.histogram(likelihoods, bins = bins)
+
+		assert len(likelihoods) == sum(counts)
+	
+		cumulative = (len(likelihoods)-np.cumsum(counts))*N/len(likelihoods)
+
+		patch = ax.stairs(cumulative, bins, label = l)
+		
+		if i == id_ref:
+			#FIXME: this is messed up somehow...
+			p = cumulative/N
+			var_mean = np.sqrt(p*(1-p)*N)
+			
+			ax.patches[-1].remove()
+			vals, edges = patch.get_data().values, patch.get_data().edges
+			ax.fill_between((edges[1:]+edges[:-1])/2., vals+var_mean, vals-var_mean, alpha = 0.3)
+			ax.plot((edges[1:]+edges[:-1])/2., vals, label = l)
+	
+	plt.legend()
+	plt.yscale('log')
+
+		#Doing scatter plot
+	scattered_feat = [dummy_feat_aggregator(sset, gen) for sset in sample_set]
+	plot_scattered_features(scattered_feat,
+			labels = labels )
+	
+
+###################
+
+args, filenames = parser.parse_known_args()
+
+gen = feature_aggregator.from_files(filenames, verbose = args.verbose)
+
+if args.merged_features_files:
+	gen.save_features(args.merged_features_files)
+
+if not args.convergence_threshold: args.convergence_threshold = 0
+
+if args.train_likelihood:
+
+	n_iter = 0
+	lm_old = None
+	ll, ll_old = np.inf, 0
+	percentile = 1
+	
+	#train_matrix = np.random.normal(0,1, size = gen.feature_matrix.shape)
+	#original_train_matrix = np.array(train_matrix)
+	train_matrix = gen.feature_matrix
+	original_train_matrix = gen.feature_matrix
+	
+	while (ll-ll_old)>args.convergence_threshold:
+
+		#tisi_matrix = np.column_stack([np.array(zlc[np.random.permutation(len(zlc))]) for zlc in gen.feature_matrix.T])
+		
+		lm = BayesianGaussianMixture(n_components = args.n_components, max_iter = args.max_iter, covariance_type = 'full', verbose = args.verbose)
+		lm.fit(train_matrix)
+		if not args.convergence_threshold: break
+		
+		ll_old = lm.score(train_matrix)
+		lls = lm.score_samples(train_matrix)
+		
+		ll_perc = np.percentile(lls, percentile)
+		ids_train, = np.where(lls>ll_perc)
+		ids_anomalies, = np.where(lls<=ll_perc)
+	
+		#plot_sample_sets([gen.feature_matrix, train_matrix, train_matrix[ids_train]],
+		#	labels = ['all','train', 'new_train'], lm = lm)
+
+		#plot_sample_sets([train_matrix, train_matrix[ids_train]],
+		#	labels = ['train', 'new_train'], lm = lm, id_ref = None)
+
+		train_matrix = train_matrix[ids_train]
+		ll = lm.score(train_matrix)
+
+		if args.verbose: print("iter {}".format(n_iter),ll, ll_old, ll-ll_old)
+		n_iter += 1
+		
+	#plot_sample_sets([original_train_matrix, train_matrix],
+	#	labels = ['all', 'train'], lm = lm, id_ref = None)
+	
+	#plt.show()
+	#quit()
+	
+	with open(args.likelihood_file, 'wb') as f:
+		pickle.dump(lm, f)
+else:
+	with open(args.likelihood_file, 'rb') as f:
+		lm = pickle.load(f)
+
+	#Do the ranking
+min_likelihood = -50
+lls = TimeSeries(lm.score_samples(gen.feature_matrix),
+		t0 = gen.t0, sample_rate = gen.srate)
+lls = np.maximum(lls, min_likelihood)
+
+likelihood_aggregator = feature_aggregator.from_dict({'likelihood': lls})
+likelihood_aggregator.save_features(args.rank_file)
+
+
+if args.plot:
+
+	basefilename = ''.join(os.path.basename(args.rank_file).split('.')[:-1])
+
+	plot_file = '{}/{}_likelihood.png'.format(os.path.dirname(args.rank_file), basefilename)
+	plt.figure()
+	plt.plot(lls)
+	plt.ylabel('Rank likelihood')
+	plt.savefig(plot_file)
+
+	basefilename = ''.join(os.path.basename(args.merged_features_files).split('.')[:-1])
+
+	plot_file = '{}/{}_scatterplot.png'.format(os.path.dirname(args.merged_features_files), basefilename)
+	plot_scattered_features(gen, plot_file)
+	
+	plot_file = '{}/{}_all_features.png'.format(os.path.dirname(args.merged_features_files), basefilename)
+	plot_features(gen, savefile = plot_file)
+
+	plot_file = '{}/{}_all_features_hist.png'.format(os.path.dirname(args.merged_features_files), basefilename)
+	plot_features(gen, True, savefile = plot_file)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

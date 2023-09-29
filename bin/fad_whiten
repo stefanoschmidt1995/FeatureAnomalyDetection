@@ -1,0 +1,176 @@
+#! /usr/bin/env python
+"""
+Executable to whiten a large portion of GW data by computing the PSD on tiny batches and interpolating.
+The PSD can be loaded in advance from MESA_segment files.
+
+To load the strain from file:
+	
+	python bin/fad_whiten --seg-length 100 --srate 2048 --input-files bullshit/H-H1_GWOSC_4KHZ_R1-1268903496-32.hdf5 --format hdf5.gwosc --save-file bullshit/fad_whiten.tar --verbose --psd-file bullshit/white_batches_IO_test/H1_MESA_OBJ-1268903496-11.dat bullshit/white_batches_IO_test/H1_MESA_OBJ-1268903503-12.dat --psd-file bullshit/white_batches_IO_test/H1_MESA_OBJ-1268903521-6.dat
+
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+import sys
+import warnings
+
+import argparse
+import os
+
+from fad import strain_loader
+
+parser = argparse.ArgumentParser(__doc__)
+parser.add_argument(
+	"--seg-length", type = float, required = False,
+	help="Length of the segment in seconds of each whitened strain batch")
+parser.add_argument(
+	"--overlap", type = float, required = False, default  = 0., 
+	help="Overlap between two consecutive batches of whitened strain")
+parser.add_argument(
+	"--srate", type = float, required = False, default = 2048.,
+	help="Sample rate of the whitened strain batch")
+
+parser.add_argument(
+	"--save-file", type = str, required = True,
+	help="Archive file to save the whitened strain batches to")
+
+
+parser.add_argument(
+	"--input-files", type = str, nargs = '+', required = False,
+	help="Input files to read the strain from. If given, --GPS-start --GPS-end will be ignored")
+
+parser.add_argument(
+	"--gps-start", type = int, required = False,
+	help="GPS start time for the strain (frames files will be searched for with gwdatafind)")
+parser.add_argument(
+	"--gps-stop", type = int, required = False,
+	help="GPS end time for the strain (frames files will be searched for with gwdatafind)")
+
+parser.add_argument(
+	"--ifo", type = str, required = False, default = 'H1', choices = ['H1', 'L1', 'V1'],
+	help="Instrument to get the data from")
+parser.add_argument(
+	"--frame-type", type = str, required = False, default = None,
+	help="Frame files to load")
+parser.add_argument(
+	"--channel", type = str, required = False, default = None,
+	help="Channel to load the strain from")
+parser.add_argument(
+	"--host", type = str, required = False, default = 'datafind.ligo.org:443',
+	help="datafind server to fetch the data from (may need a proxy)")
+parser.add_argument(
+	"--format", type = str, required = False, default = None,
+	help="Format for the strain to load. It must be understandable from gwpy.")
+
+parser.add_argument(
+	"--mesa-method", type = str, default = 'standard', choices = ['standard', 'fast'],
+	help="Which MESA method to use to solve the PSD.")
+
+parser.add_argument(
+	"--psd-file", type = str, default = None, action='append', nargs='+',
+	help="A MESA_segment file to load the PSD from")
+	
+parser.add_argument(
+	"--batch-whitening", action='store_true',
+	help="Whether to perform batch whitening. If given, argument --psd-file will be ignored and PSD will be estimated.")
+	
+parser.add_argument(
+	"--plot", action='store_true',
+	help="Whether to plot the PSDs of the segments")
+parser.add_argument(
+	"--verbose", action='store_true',
+	help="Be verbose?")
+
+####################
+
+args, filenames = parser.parse_known_args()
+
+assert args.input_files or (args.gps_start and args.gps_stop), "One argument between --input-files and --gps-start, --gps-end must be provided"
+
+if not args.seg_length:
+	if args.batch_whitening:
+		raise ValueError("If --batch-whitening is given, --seg-length must be set")
+	else:
+		assert not arg.psd_file, "If psd-file is not given, --seg-length must be provided for PSD estimation"
+
+sl = strain_loader(args.seg_length, overlap = args.overlap, srate = args.srate, verbose = args.verbose)
+
+if isinstance(args.channel, str):
+	if not args.channel.startswith(args.ifo): channel = args.ifo+':'+args.channel
+if isinstance(args.frame_type, str):
+	if not args.frame_type.startswith(args.ifo):
+		frame = args.ifo+'_'+args.frame_type
+
+if args.input_files:
+	load_args = {'format': args.format}
+	if args.channel: load_args['channel'] = channel
+	if args.gps_start: load_args['GPS_start'] = args.gps_start
+	if args.gps_stop: load_args['GPS_stop'] = args.gps_stop
+	
+	sl.fetch_strain(filename = args.input_files, **load_args)
+
+elif (args.gps_start and args.gps_stop):
+
+	sl.fetch_strain(GPS_start = args.gps_start, GPS_stop = args.gps_stop,
+		frame = frame, channel = channel, host = args.host, format=args.format)
+
+if not args.batch_whitening:
+	if args.psd_file:
+		for f in args.psd_file:
+			sl.add_mesa_segment(f)
+	else:
+		sl.estimate_PSD(method = args.mesa_method)
+
+if args.batch_whitening:
+	sl.whiten_batch(method = args.mesa_method)
+else:
+	sl.whiten_interpolation(method = args.mesa_method)
+
+import scipy.stats
+x = np.sort(np.array(sl.white_strain_segments[0]))
+plt.hist(x, density = True, bins = int(np.sqrt(len(x))))
+plt.plot(x, scipy.stats.norm(scale = 1).pdf(x))
+plt.yscale('log')
+plt.show()
+
+sl.save_zip(args.save_file, save_mesa = not args.psd_file or args.batch_whitening)
+quit()
+
+if args.plot:
+
+	for ms in sl.mesa_segments:
+
+		plot_file = '{}/PSD-{}-{}.png'.format(os.path.dirname(args.save_file), int(ms['start']), int(ms['duration']))
+		mesa_obj  = ms['mesa']
+		
+		plt.figure()
+		plt.title('{} PSD {} - {}'.format(args.ifo, int(ms['start']), int(ms['duration'])))
+		plt.loglog(*mesa_obj.spectrum(dt = 1./args.srate, onesided = True))
+		plt.xlabel('f (Hz)')
+		plt.ylabel('PSD (1/Hz)')
+		plt.savefig(plot_file)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

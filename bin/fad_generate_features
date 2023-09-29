@@ -1,0 +1,139 @@
+#! /usr/bin/env python
+"""
+Given a set of white batches files, it extracts a timeseries with a feature
+
+To generate some features from strain file:
+	
+	python bin/fad_generate_features --feature-type var --srate 10 --input-srate 2048 --n-window 5000 --stride 1000 --feature-name test_var --strain-file bullshit/test_compress.tar --output-file bullshit/test_executable/features/var_features.csv --plot --verbose
+
+To generate features from white noise:
+
+	python bin/fad_generate_features --feature-type var --srate 10 --input-srate 2048 --n-window 5000 --stride 1000 --feature-name test_var --output-file bullshit/test_executable/features/var_features.csv --plot --verbose --gaussian-noise --duration 1000
+
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+import sys
+import warnings
+
+import argparse
+import os
+
+from fad import variance_feature, KL_feature, FD_feature, far_qtranform_feature, max_feature
+from fad import strain_loader, feature_aggregator, gaussian_noise_loader
+
+available_feature_generators = {
+	'FD': FD_feature,
+	'KL': KL_feature,
+	'var':variance_feature,
+	'FAR':far_qtranform_feature,
+	'max': max_feature
+}
+
+#TODO: check that the overlap is inferred correctly!
+
+parser = argparse.ArgumentParser(__doc__)
+parser.add_argument(
+	"--feature-type", type = str, required = True, choices = list(available_feature_generators.keys()),
+	help="Type of feature to extract from data")
+parser.add_argument(
+	"--srate", type = float, required = True,
+	help="Sample rate for the output feature")
+parser.add_argument(
+	"--input-srate", type = float, required = True,
+	help="Sample rate for the input timeseries")
+
+parser.add_argument(
+	"--n-window", type = int, required = True,
+	help="Length of the window over which each feature is computed")
+parser.add_argument(
+	"--stride", type = int, required = True,
+	help="Stride of the moving window")
+
+parser.add_argument(
+	"--feature-name", type = str, required = False,
+	help="An optional unique name for the feature")
+
+parser.add_argument(
+	"--strain-file", type = str, required = False,
+	help="Archive file to load the whitened strain batches from")
+parser.add_argument(
+	"--output-file", type = str, required = True,
+	help="Output file where all the features are stored in csv format")
+
+parser.add_argument(
+	"--gaussian-noise", action='store_true',
+	help="Whether to use gaussian noise to compute the features")
+parser.add_argument(
+	"--duration", type = float, required = False,
+	help="Length in seconds of the white gaussian noise (only if --gaussian-noise is given)")
+parser.add_argument(
+	"--seed", type = int, required = False, default = 0,
+	help="Seed for the gaussian noise generator")
+
+
+parser.add_argument(
+	"--plot", action='store_true',
+	help="Whether to plot the feature timeseries")
+parser.add_argument(
+	"--verbose", action='store_true',
+	help="Be verbose?")
+
+####################
+
+args, filenames = parser.parse_known_args()
+
+if not args.gaussian_noise: assert isinstance(args.strain_file, str), "Strain file must be given in the case of no gaussian noise"
+
+
+feat_gen = available_feature_generators[args.feature_type](args.input_srate, args.n_window, stride=args.stride,
+		filename = None, feature_name = args.feature_name, store_features = False, verbose = False)
+
+if args.gaussian_noise:
+	sl = gaussian_noise_loader(args.duration, 1, srate = args.input_srate, seed = args.seed)
+else:
+	sl = strain_loader(None, overlap = None, srate = args.input_srate, verbose = args.verbose)
+	sl.load_zip(args.strain_file)
+
+fa = feature_aggregator([feat_gen], sl, srate = args.srate, verbose = args.verbose)
+fa.compute_features()
+fa.save_features(args.output_file)
+
+	#Plotting
+if args.plot:
+	basefilename = ''.join(os.path.basename(args.output_file).split('.')[:-1])
+	plot_file = '{}/{}.png'.format(os.path.dirname(args.output_file), basefilename)
+	
+	feat_ts = fa.features[args.feature_name]
+	plt.figure()
+	plt.plot(feat_ts.times[:len(feat_ts)], feat_ts)
+	plt.xlabel('GPS time')
+	plt.ylabel(args.feature_name)
+	plt.savefig(plot_file)
+	plt.show()
+
+#TODO: maybe you can zip all the whitened batches? It might be easier to transfer with condor: will save a lot of book-keeping... Or maybe it's fine like this!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

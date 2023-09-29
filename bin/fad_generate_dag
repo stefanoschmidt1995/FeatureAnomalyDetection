@@ -1,0 +1,341 @@
+#! /usr/bin/env python
+"""
+Executable to make a fad dag
+"""
+import numpy as np
+import yaml
+import ezdag
+from ezdag import Argument, DAG, Option, Layer, Node
+
+import sys
+import warnings
+
+import argparse
+import os
+import shutil
+from gwpy.timeseries import TimeSeries
+from gwpy.segments import Segment
+
+from pathlib import Path
+
+############################################################################
+
+def attach_white_batches_layer(dag, segments):
+	white_batches_files = []
+		
+	if proxy:
+		white_batches_requirements = {**requirements, 'x509userproxy': proxy,
+			'use_x509userproxy': True}
+	else:
+		white_batches_requirements = requirements
+
+	white_batches_layer = Layer("fad_white_batches",
+			name = "white_batches",
+			universe = 'vanilla',
+			retries = 2, transfer_files = False,
+			requirements=white_batches_requirements)
+
+	for i, segment in enumerate(segments):
+	
+			#white_batches layer
+		start, duration = segment.start, (segment.end-segment.start)
+
+		white_batch_file = strain_folder+'WHITE_BATCHES_{}Hz-{}-{}.tar'.format(int(strain_srate), int(start), int(duration))
+		
+		args = [Option('srate', strain_srate),
+			Option('seg-length', config_opts['white_batches']['seg-length']),
+			Option('gps-start', int(segment.start)),
+			Option('gps-stop', int(segment.end))
+			]
+		if plot: args.append(Option('plot'))
+		if 'overlap' in config_opts['white_batches']:
+			args.append(Option('overlap', config_opts['white_batches']['overlap']))
+		args.extend([Option(k_,v_) for k_,v_ in config_opts['white_batches']['source'].items()])
+		if filenames: args.append(Option('input-files', filenames[i]))
+		
+		if verbose: args.append(Option('verbose'))
+		
+		white_batches_layer += Node(
+				arguments = args,
+				outputs = [Option("save-file", white_batch_file)]
+			)
+		white_batches_files.append(white_batch_file)
+
+	dag.attach(white_batches_layer)
+	return white_batches_files
+
+
+def attach_features_layers(dag, gaussian_noise, segments, white_batches_files = None):
+	if gaussian_noise:
+		name = "gaussian_features_{}" 
+	else:
+		name = "features_{}"
+
+	output_files = {}
+
+	for k, v in config_opts['generate_features'].items():	
+		
+		if not isinstance(v, dict): continue
+		feature_layer = Layer("fad_generate_features",
+			name = name.format(k),
+			universe = 'vanilla',
+			retries = 2, transfer_files = False,
+			requirements=requirements)
+		output_files[k] = []
+
+		for i, segment in enumerate(segments):
+	
+				#white_batches layer
+			start, duration = segment.start, (segment.end-segment.start)
+
+			if gaussian_noise:
+				feat_outfile = features_folder+'GAUSSIAN_FEATURE_{}_{}Hz-0-{}.csv'.format(k.upper(), int(feat_srate), int(duration))
+			else:
+				feat_outfile = features_folder+'FEATURE_{}_{}Hz-{}-{}.csv'.format(k.upper(), int(feat_srate), int(start), int(duration))
+
+			args = [Option(k_, v_) for k_, v_ in config_opts['gaussian_batches'].items()] if gaussian_noise else []
+			args.extend([Option('feature-name', k), Option('srate', feat_srate)])
+		
+			if gaussian_noise: args.append(Option('gaussian-noise'))
+			else: args.append(Option('strain-file', white_batches_files[i]))
+			
+			args.extend([Option(k_, v_) for k_, v_ in v.items()])
+			if verbose: args.append(Option('verbose'))
+			if plot: args.append(Option('plot'))
+		
+			inputs = [] if gaussian_noise else Option("strain-file", white_batches_files[i])
+			feature_layer += Node(
+				arguments = args,
+				inputs = inputs,
+				outputs = Option("output-file", feat_outfile)
+			)
+			output_files[k].append(feat_outfile)
+		
+		dag.attach(feature_layer)
+	
+	return output_files
+
+def attach_rank_layer(dag, gaussian_noise, segments, features_files):
+
+	if gaussian_noise: name = "gaussian_rank" 
+	else: name = "rank"
+
+	rank_layer = Layer("fad_rank",
+		name = name,
+		universe = 'vanilla',
+		retries = 2, transfer_files = False,
+		requirements=requirements)
+	rank_files = []
+	
+	for i, segment in enumerate(segments):
+	
+			#white_batches layer
+		start, duration = segment.start, (segment.end-segment.start)
+		
+		if gaussian_noise:
+			merged_feat_file = features_folder+'GAUSSIAN_MERGED_FEATURES_{}Hz-0-{}.csv'.format(int(feat_srate), int(duration))
+		else:
+			merged_feat_file = features_folder+'MERGED_FEATURES_{}Hz-{}-{}.csv'.format(int(feat_srate), int(start), int(duration))
+
+		if gaussian_noise:
+			rank_file = rank_folder+'GAUSSIAN_RANK_{}Hz-0-{}.csv'.format(int(feat_srate), int(duration))
+		else:
+			rank_file = rank_folder+'RANK_{}Hz-{}-{}.csv'.format(int(feat_srate), int(start), int(duration))
+		
+			#Dealing with likelihood file (FIXME: understand what to do)
+
+		#if 'gaussian_batches' in config_opts:
+		#	likelihood_file = rank_folder+'LIKELIHOOD.pkl'
+		#else:
+		#	try:
+		#		likelihood_file = config_opts['rank']['likelihood-file']
+		#	except KeyError:
+		#		msg = "If no likelihood training is performed (i.e. no 'gaussian_batches' in the config), you must specify a likelihood-file for the rank jobs."
+		#		raise ValueError(msg)
+		if gaussian_noise:
+			likelihood_file = rank_folder+'GAUSSIAN_LIKELIHOOD_{}Hz-0-{}.pkl'.format(int(feat_srate), int(duration))
+		else:
+			likelihood_file = rank_folder+'LIKELIHOOD_{}Hz-{}-{}.pkl'.format(int(feat_srate), int(start), int(duration))
+		
+		in_feat_files = [v[i] for k, v in features_files.items()]
+		
+		args = [Option(k_, v_) for k_, v_ in config_opts['rank'].items()]
+		args.append(Option('likelihood-file', likelihood_file))
+		#if gaussian_noise: args.append(Option('train-likelihood'))
+		args.append(Option('train-likelihood'))
+		if verbose: args.append(Option('verbose'))
+		if plot: args.append(Option('plot'))
+		rank_layer += Node(
+				arguments = args,
+				inputs = Argument('input', in_feat_files),
+				outputs = [Option("merged-features-files", merged_feat_file),
+						   Option("rank-file", rank_file)]
+			)
+		rank_files.append(rank_file)
+	dag.attach(rank_layer)
+	return rank_files
+
+def attach_spectrogram_layer(dag, rank_files, white_batches_files):
+	spectrogram_layer = Layer("fad_plot_spectrograms",
+		name = 'spectrogram',
+		universe = 'vanilla',
+		retries = 2, transfer_files = False,
+		requirements=requirements)
+	print(rank_files)
+	print(white_batches_files)
+	
+	for rf, wbf in zip(rank_files, white_batches_files):
+		args = [Option(k_, v_) for k_, v_ in config_opts['spectrogram'].items()]
+		args.append(Option("output-folder", spectrograms_folder))
+		spectrogram_layer += Node(
+				arguments = args,
+				inputs = [Option("rank-file", rf),Option("strain-file", wbf)],
+			)
+	dag.attach(spectrogram_layer)
+	
+
+############################################################################
+
+parser = argparse.ArgumentParser(__doc__)
+
+parser.add_argument(
+	"--force", action='store_true',
+	help="Whether to create the dag also if the folder already exists.")
+
+args, config_file = parser.parse_known_args()
+
+assert len(config_file) == 1, "Exactly one config file must be provided"
+config_file = config_file[0]
+
+with open(config_file, 'r') as file:
+	config_opts = yaml.safe_load(file)
+
+print("Config file: ")
+for k,v in config_opts.items():
+	print('\t', k, v)
+
+	#Parsing general
+dag_folder = config_opts['general'].get('dagfolder', './fad_dag')
+if not dag_folder.endswith('/'): dag_folder = dag_folder+'/'
+verbose = config_opts['general'].get('verbose', False)
+if verbose is None: verbose = True
+plot = config_opts['general'].get('plot', False)
+if plot is None: plot = True
+proxy = config_opts['general'].get('userproxy', None)
+
+	#Making directories
+try:
+	os.makedirs(dag_folder, exist_ok = args.force)
+except FileExistsError:
+	if not args.force: raise ValueError("Folder '{}' for the dag already exists, use --force option to continue".format(dag_folder))
+
+features_folder = 'features/'
+strain_folder = 'strain/'
+rank_folder = 'rank/'
+log_folder = 'logs/'
+for folder in [features_folder, strain_folder, rank_folder, log_folder]:
+	os.makedirs(dag_folder+folder, exist_ok = args.force)
+if plot:
+	spectrograms_folder = 'spectrograms/'
+	os.makedirs(dag_folder+spectrograms_folder, exist_ok = args.force)
+
+	#Splitting the relevant time span into segments according to 'max_segment_duration'
+GPS_start = config_opts['white_batches']['source'].pop('gps-start', None)
+GPS_stop = config_opts['white_batches']['source'].pop('gps-stop', None)
+channel = config_opts['white_batches']['source'].get('channel', None)
+ifo = config_opts['white_batches']['source'].get('ifo', None)
+if channel and ifo:
+	channel = ':'.join((ifo, channel))
+
+	#GPS start and stop must be read from file
+if not (GPS_start and GPS_stop):
+	filenames = config_opts['white_batches']['source'].pop('input-files', None)
+	if filenames is None: raise ValueError("If gps-start and gps-stop are not given, a valid file must be provided to load the data from")
+	else: filenames = filenames.split(' ')
+
+	segments = []
+	kwargs = {'channel': channel} if channel else {}
+	for f in filenames:
+		ts = TimeSeries.read(f,
+				format = config_opts['white_batches']['source'].get('format', None),
+				**kwargs)
+		GPS_start, GPS_stop = ts.t0.value, (ts.t0 + ts.duration).value
+		segments.append(Segment(GPS_start, GPS_stop))		
+		del ts
+	
+	
+else:
+	filenames = []
+	max_duration = config_opts['white_batches']['source'].get('max-segment-duration')
+	if not max_duration: max_duration = GPS_stop - GPS_start
+	segments = []
+	for t in range(GPS_start, GPS_stop, max_duration):
+		t_end = t+ min(max_duration, GPS_stop-t)
+		segments.append(Segment(t, t_end))
+
+print("############# Starting dag creation")
+
+# create DAG
+dag = DAG()
+
+# define job requirements
+requirements = {"request_cpus": 2, "request_memory": 2000, "getenv": True}
+
+feat_srate = config_opts['generate_features']['srate']
+strain_srate = config_opts['white_batches']['srate']
+
+white_batches_files = attach_white_batches_layer(dag, segments)
+feat_files = attach_features_layers(dag, False, segments, white_batches_files = white_batches_files)
+rank_files = attach_rank_layer(dag, False, segments, feat_files)
+
+if plot:
+	attach_spectrogram_layer(dag, rank_files, white_batches_files)
+
+	#Dealing with gaussian features
+if 'gaussian_batches' in config_opts:
+	white_noise_segments = [Segment(0, config_opts['gaussian_batches']['duration'])]
+	gaussian_feat_files = attach_features_layers(dag, True, white_noise_segments, white_batches_files = None)	
+	gaussian_rank_files = attach_rank_layer(dag, True, white_noise_segments, gaussian_feat_files)
+
+
+dag.write_dag("fad_dag.dag", path = Path(dag_folder))
+dag.write_script("fad_dag.sh", path = Path(dag_folder))
+
+print('Created dag @ {}'.format(Path(dag_folder)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

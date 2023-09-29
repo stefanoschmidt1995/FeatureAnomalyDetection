@@ -1,0 +1,129 @@
+#! /usr/bin/env python
+"""
+Given a ranking file and a white batches file, it plots the spectrogram of the times with a likelihood smaller than a threshold
+
+To run
+	python bin/fad_plot_spectrograms --rank-file rank/RANK_2Hz-1268891648-4096.csv --strain-file strain/WHITE_BATCHES_2048Hz-1268891648-4096.tar --output-folder spectrograms --ll-threshold 0 --duration 10
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+import sys
+import warnings
+
+import argparse
+import os
+
+import scipy.signal
+
+from gwpy.timeseries import TimeSeries
+import fad.utils
+from fad import feature_aggregator, feature_generator, strain_loader
+from fad.utils import plot_features, plot_scattered_features
+
+from sklearn.mixture import BayesianGaussianMixture
+import pickle
+from pathlib import Path
+
+parser = argparse.ArgumentParser(__doc__)
+
+parser.add_argument(
+	"--rank-file", type = str, required = True,
+	help="")
+parser.add_argument(
+	"--strain-file", type = str, required = True,
+	help="Archive file to load the whitened strain batches from")
+
+parser.add_argument(
+	"--output-folder", type = str, required = True,
+	help="Folder where all the spectrograms are plotted")
+
+parser.add_argument(
+	"--ll-threshold", type = float, required = False, default = 0.,
+	help="Threshold for generating the spectrogram.")
+
+parser.add_argument(
+	"--duration", type = float, required = False, default = 10.,
+	help="Duration of the spectrogram.")
+parser.add_argument(
+	"--show", action='store_true',
+	help="Whether to show the plotted spectrograms")
+	
+args, _ = parser.parse_known_args()
+
+################################################
+
+output_folder = Path(args.output_folder)
+
+gen = feature_aggregator.from_files(args.rank_file, verbose = False)
+ll_ts = gen.features['likelihood']
+id_peaks, = np.where(np.array(ll_ts)<args.ll_threshold)
+#id_peaks, ll_peaks = scipy.signal.find_peaks(-ll_ts, height = -args.ll_threshold))
+#ll_peaks = -ll_peaks['peak_heights']
+
+
+n_window = int(args.duration*ll_ts.sample_rate.value)//2
+n_window = max(n_window, 1)
+close_to_the_past = np.array([np.inf, *np.diff(id_peaks)])<n_window
+
+ids_start, ids_end = [], []
+
+for id_, cp in zip(id_peaks, close_to_the_past):
+	if cp: ids_end[-1] = id_
+	else:
+		ids_start.append(id_)
+		ids_end.append(id_)
+
+if args.show:
+	plt.figure()
+	plt.plot(ll_ts)
+	for t_start, t_end in zip(ll_ts.times[ids_start].value, ll_ts.times[ids_end].value):
+		plt.axvline(x = (t_start+t_end)/2, ls = '--', c = 'k')
+		plt.gca().axvspan(t_start, t_end, alpha=0.5, color='red')
+	plt.axhline(y = args.ll_threshold, ls = '--', c = 'blue')
+	plt.show()
+
+sl = strain_loader(None, overlap = None, srate = None, verbose = False)
+sl.load_zip(args.strain_file)
+
+print(sl.segment_length, sl.overlap, sl.srate)
+
+#for t, ll in zip(ll_ts.times[id_peaks].value, ll_peaks):
+for id_s, id_e in zip(ids_start, ids_end):
+	
+	ll = np.min(ll_ts[id_s:id_e]) if id_e>id_s else ll_ts[id_s]
+	anomaly_start = ll_ts.times[id_s].value
+	anomaly_end = ll_ts.times[id_e].value + 1/ll_ts.sample_rate.value
+	print("Anomaly LL = {} | ({}, {})".format(ll, anomaly_start, anomaly_end))
+
+	GPS_start = anomaly_start - args.duration/2
+	GPS_stop = anomaly_end + args.duration/2
+	
+	savefile = output_folder/'SPECTROGRAM_{}_{}.png'.format(int(GPS_start), int(GPS_stop-GPS_start))
+	sl.plot_q_transform(GPS_start, GPS_stop, savefile = None, ax = None)
+	ax = plt.gca()
+	ax.set_title('Anomaly LL = {}\nSegment: [{}, {})'.format(ll, anomaly_start, anomaly_end))
+	plt.axvline(x = anomaly_start, ls = '--', c = 'r')
+	plt.axvline(x = anomaly_end, ls = '--', c = 'r')
+
+	plt.savefig(savefile)
+	if args.show: plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
